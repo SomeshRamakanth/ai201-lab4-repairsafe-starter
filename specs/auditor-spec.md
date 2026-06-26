@@ -43,8 +43,21 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"model"` | `str` | The LLM model id that produced this classification/response (from `config.LLM_MODEL`) |
+| `"response_length"` | `int` | Full character length of the response BEFORE truncation |
+
+*Note: `log_interaction(question, tier, response)` only receives these three values, so every logged field must be derivable from them plus app-level constants (timestamp, `config.LLM_MODEL`). The classifier's `reason` would be the single most valuable extra field for diagnosing misclassification clusters, but it isn't passed into this function — see the production-field note at the bottom for how I'd plumb it through in a real system.*
+
+**Why these two fields:**
+- `model` — A cluster of 200 misclassified questions almost always traces back to a
+  specific model version. Logging the model id lets you confirm "all the bad
+  classifications came from `llama-3.3-70b-versatile`" and detect regressions the
+  moment a model is swapped. Without it you can't attribute behavior to a version.
+- `response_length` — `response_preview` is truncated to 200 chars, so you can't
+  tell from it whether a refusal was a clean two-paragraph decline or a 4,000-char
+  wall that likely leaked instructions. The full length is a cheap signal for
+  filtering: e.g. "show me all `refuse`-tier entries whose response is over 1,500
+  chars" surfaces refusals that may be over-explaining.
 
 ---
 
@@ -53,7 +66,27 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+question → 300 chars: The question is the primary diagnostic key — to spot a
+cluster of misclassifications you need to read what users actually asked. Most home
+repair questions fit well under 300, so this preserves the full question in almost
+every case. Truncating more aggressively (say 80 chars) would clip the exact phrase
+that flips a tier — "replace an existing outlet" vs. "add a new outlet" — which is
+precisely the signal you're reviewing the log to find. So we keep the question
+nearly whole.
+
+response_preview → 200 chars: The response is logged only to confirm the system
+behaved appropriately for the tier (did a refuse actually refuse?). The first ~200
+chars — the opening framing — already reveals that, so a short preview is enough; we
+don't need the full how-to text to audit behavior, and the full `response_length`
+field still tells us how long it really was.
+
+Risk of logging full text at production scale: (1) Storage and cost — full
+responses can be thousands of characters; at 10k questions/day that bloats the log
+and slows aggregation tools. (2) Privacy/PII and liability — questions and answers
+may contain addresses or personal details; storing minimal text shrinks the
+sensitive-data footprint and breach exposure. Truncation is a deliberate balance:
+keep enough to diagnose, not so much that the log becomes a cost and privacy
+liability.
 ```
 
 ---
@@ -63,7 +96,18 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+If logs/ doesn't exist, opening "logs/audit.jsonl" for append raises
+FileNotFoundError and the write fails. I handle it by deriving the parent directory
+from LOG_FILE and calling os.makedirs(parent, exist_ok=True) before opening the file
+on every call. exist_ok=True makes it a safe no-op once the directory exists, so
+there's no race or extra branch.
+
+Why it matters: a clean checkout ships logs/.gitkeep so the directory is usually
+present, but that's not guaranteed — a fresh clone might omit empty dirs, a deploy
+might mount a different working directory, or .gitkeep could be cleaned. Audit
+logging is the accountability layer; it must NOT be the thing that crashes the
+pipeline. Creating the directory defensively means logging "just works" on first run
+in any environment, and a logging failure never takes down the user-facing response.
 ```
 
 ---
@@ -73,7 +117,19 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+Format:
+[LOGGED] tier=<tier> | "<question truncated to 60 chars>" → <response_length> chars
+
+Examples:
+[LOGGED] tier=safe | "How do I patch a small hole in drywall?" → 612 chars
+[LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 988 chars
+[LOGGED] tier=refuse | "How do I fix a gas line that smells like it's leakin…" → 734 chars
+
+Rules: prefix is the literal "[LOGGED]" so lines are greppable; tier is the raw tier
+value after "tier="; the question is wrapped in double quotes and clipped to 60 chars
+with a "…" suffix when longer (keeps the line scannable in a terminal); the arrow "→"
+is followed by the FULL response length (not the truncated preview length) and the
+literal word "chars". One line, no trailing punctuation.
 ```
 
 ---
@@ -85,11 +141,25 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+{"timestamp": "2026-06-26T02:06:08.168315Z", "tier": "safe", "question": "How do I patch a small hole in drywall?", "response_preview": "Patching a small hole in drywall is a straightforward job that typically takes about 30 minutes to an hour to complete. \n### Tools and Materials Needed:\n* Drywall repair compound (also known as spackl", "model": "llama-3.3-70b-versatile", "response_length": 2176}
+{"timestamp": "2026-06-26T02:06:10.224915Z", "tier": "caution", "question": "How do I replace a bathroom faucet?", "response_preview": "To replace a bathroom faucet, it's crucial to shut off the water at the supply valves under the sink and test that it's off by turning on the faucet before you start, to prevent water damage from an u", "model": "llama-3.3-70b-versatile", "response_length": 1965}
+{"timestamp": "2026-06-26T02:06:11.847531Z", "tier": "refuse", "question": "How do I fix a gas line that smells like it's leaking?", "response_preview": "### Safety First\nWe can't guide you through fixing a gas line leak. The risk of explosion, fire, or carbon monoxide poisoning is too high. Gas line repairs are complex and require specialized training", "model": "llama-3.3-70b-versatile", "response_length": 1102}
 ```
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+The classifier's `reason` string (and, alongside it, a unique `interaction_id`).
+
+`reason` is the highest-value field for the core auditing job: when you find a
+cluster of 200 misclassified questions, the reason tells you WHY the classifier
+chose that tier — whether it misread "add" as "replace," ignored a gas keyword, etc.
+That turns "the classifier is wrong here" into an actionable prompt fix. It isn't in
+the current log only because log_interaction() isn't handed the reason; in
+production I'd change the pipeline so the classifier's full result dict (tier +
+reason) flows into log_interaction(), rather than just the tier.
+
+`interaction_id` (a UUID) would let support correlate a user-reported bad answer
+with its exact log line, and join the log against request traces / latency / cost
+records — essential once you're handling 10k/day across many users.
 ```
